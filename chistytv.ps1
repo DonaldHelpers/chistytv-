@@ -13,9 +13,11 @@
 [CmdletBinding()]
 param(
   [string]$TvIp,
-  [ValidateSet('menu', 'clean', 'restore', 'youtube', 'launcher', 'dns', 'info', 'report')]
+  [ValidateSet('menu', 'clean', 'restore', 'youtube', 'launcher', 'dns', 'info', 'report', 'app')]
   [string]$Action = 'menu',
   [string]$Subscription,
+  [string]$ApkPath,
+  [string]$ApkUrl,
   [switch]$Yes,
   [string]$AdbPath,
   [string]$DataPath,

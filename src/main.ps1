@@ -15,9 +15,11 @@
 [CmdletBinding()]
 param(
   [string]$TvIp,
-  [ValidateSet('menu', 'clean', 'restore', 'youtube', 'launcher', 'dns', 'info', 'report')]
+  [ValidateSet('menu', 'clean', 'restore', 'youtube', 'launcher', 'dns', 'info', 'report', 'app')]
   [string]$Action = 'menu',
   [string]$Subscription,
+  [string]$ApkPath,
+  [string]$ApkUrl,
   [switch]$Yes,
   [string]$AdbPath,
   [string]$DataPath,
@@ -30,7 +32,7 @@ $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Script:Version = '0.2.11'
+$Script:Version = '0.3.0'
 $Script:Repo = 'by-sonic/chistytv'
 $Script:RawBase = "https://raw.githubusercontent.com/$($Script:Repo)/main"
 $Script:Vpn = @{
@@ -696,6 +698,10 @@ function Install-Apk([string]$File, [string]$Label) {
     Say '    Удалите ненужные приложения: Настройки → Приложения (обычно больше всего весят игры и онлайн-кинотеатры), и запустите пункт снова.' 'DarkGray'
   }
   if ($out -match 'VERIFICATION_FAILURE') { Say '    Прошивка запрещает установку сторонних приложений по ADB.' 'DarkGray' }
+  if ($out -match 'MISSING_SPLIT') { Say '    Это часть приложения из набора (split APK): одного файла мало. Нужен полный .apk.' 'DarkGray' }
+  if ($out -match 'OLDER_SDK') { Say "    $Label требует более новый Android, чем на этом телевизоре (Android $($Script:Info.Android))." 'DarkGray' }
+  if ($out -match 'INCONSISTENT_CERTIFICATES|UPDATE_INCOMPATIBLE') { Say "    На ТВ уже стоит $Label с другой подписью. Удалите его (Настройки → Приложения → $Label → Удалить) и поставьте этот файл." 'DarkGray' }
+  if ($out -match 'VERSION_DOWNGRADE') { Say '    На ТВ уже стоит более новая версия этого приложения.' 'DarkGray' }
   if ($out -match 'NO_MATCHING_ABIS') { Say "    У $Label нет сборки под процессор этого телевизора ($($Script:Info.AbiList))." 'DarkGray' }
   return $false
 }
@@ -1038,6 +1044,228 @@ function Set-TvLauncher {
   }
 }
 
+# ─── Установка любого приложения ─────────────────────────────────────────
+
+# Каталог известных приложений (data\apps.json рядом с packages.json). Нет каталога — не страшно:
+# приложение можно поставить и по пути к файлу, и по ссылке.
+function Load-Apps {
+  try {
+    $json = $null
+    if ($DataPath) {
+      $local = Join-Path (Split-Path (Resolve-Path $DataPath).Path) 'apps.json'
+      if (Test-Path -LiteralPath $local) { $json = [IO.File]::ReadAllText($local, [Text.Encoding]::UTF8) }
+    } else {
+      $json = (Invoke-WebRequest -UseBasicParsing -Uri "$($Script:RawBase)/data/apps.json").Content
+      if ($json -is [byte[]]) { $json = [Text.Encoding]::UTF8.GetString($json) }
+    }
+    if ($json) { return @(($json.TrimStart([char]0xFEFF) | ConvertFrom-Json).apps) }
+  } catch { }
+  return @()
+}
+
+function Get-InstalledPackages {
+  return @((Sh 'pm list packages') -split "`n" | ForEach-Object { ($_ -replace '^package:', '').Trim() } | Where-Object { $_ })
+}
+
+# Что не так с файлом, если он не годится как APK. Пустая строка — файл годится.
+function Get-ApkProblem([string]$File) {
+  if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { return 'файл не найден' }
+  $ext = [IO.Path]::GetExtension($File).ToLower()
+  if ($ext -in @('.xapk', '.apks', '.apkm')) {
+    return "это набор файлов ($ext), а не один APK. Нужен обычный .apk (у приложений для ТВ он обычно один)."
+  }
+  try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $zip = [IO.Compression.ZipFile]::OpenRead($File)
+    try { $names = @($zip.Entries | ForEach-Object { $_.FullName }) } finally { $zip.Dispose() }
+  } catch {
+    return 'файл повреждён или это не APK (не открывается как архив).'
+  }
+  if ($names -contains 'AndroidManifest.xml') { return '' }
+  if ($names -contains 'manifest.json' -or @($names | Where-Object { $_ -like '*.apk' }).Count) {
+    return 'внутри несколько APK — это набор. Нужен один обычный .apk.'
+  }
+  return 'в файле нет AndroidManifest.xml — это не APK.'
+}
+
+# Ссылка → файл в папке apk. Только https: по http файл можно подменить по дороге.
+function Save-ApkFromUrl([string]$Url) {
+  if ($Url -notmatch '^https://[A-Za-z0-9\-\._~:/\?#\[\]@!\$\(\)\*\+,;=%&]+$') {
+    Fail 'Нужна ссылка вида https://… без пробелов. Ссылки http:// не принимаю: файл можно подменить по дороге.'
+    return $null
+  }
+  $leaf = [IO.Path]::GetFileName(([uri]$Url).AbsolutePath) -replace '[^\w\.\-]', '_'
+  if (-not $leaf) { $leaf = 'app' }
+  if ($leaf -notlike '*.apk') { $leaf += '.apk' }
+  $dir = Join-Path $WorkDir 'apk'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $file = Join-Path $dir "url-$leaf"
+  $part = "$file.part"
+  try {
+    Say "  Скачиваю $leaf с $(([uri]$Url).Host)…" 'DarkGray'
+    Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $part
+    Move-Item -LiteralPath $part -Destination $file -Force
+    return $file
+  } catch {
+    Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue
+    Fail "Не удалось скачать: $(Get-ShortError $_.Exception.Message)"
+    return $null
+  }
+}
+
+# Путь к файлу (в том числе в кавычках — так вставляет перетаскивание в окно) или ссылка → файл
+function Resolve-ApkSource([string]$Text) {
+  $t = "$Text".Trim().Trim('"').Trim("'").Trim()
+  if (-not $t) { return $null }
+  if ($t -match '^https?://') { return (Save-ApkFromUrl $t) }
+  $t = [Environment]::ExpandEnvironmentVariables($t)
+  if (-not (Test-Path -LiteralPath $t -PathType Leaf)) {
+    Fail "Не нашёл файл: $t"
+    return $null
+  }
+  return (Resolve-Path -LiteralPath $t).Path
+}
+
+function Get-NewestDownload {
+  $downloads = Join-Path $env:USERPROFILE 'Downloads'
+  return (Get-ChildItem $downloads -Filter '*.apk' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+}
+
+# Приложение из каталога: файл ищем в «Загрузках» и в кэше по имени пакета, иначе просим скачать
+function Get-CatalogApk($App) {
+  foreach ($dir in @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $WorkDir 'apk'))) {
+    $found = Get-ChildItem $dir -Filter "$($App.package)*.apk" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($found) {
+      Say "  Нашёл $($found.Name) в «$dir»" 'DarkGray'
+      return $found.FullName
+    }
+  }
+  Say "  $($App.title): ЧистыйТВ не хранит прямых ссылок на APK — скачайте файл с официальной страницы:" 'White'
+  if ($App.page) { Say "    $($App.page)" 'White' }
+  Say "  Потом положите APK в «Загрузки» (имя файла должно начинаться с «$($App.package)») или укажите путь к нему ниже." 'DarkGray'
+  if (-not $Yes -and $App.page -and (Confirm 'Открыть страницу в браузере?')) {
+    try { Start-Process $App.page } catch { Warn "Браузер не открылся: $($App.page)" }
+  }
+  $answer = Ask 'Путь к APK или ссылка https://… (Enter — самый свежий APK из «Загрузок»)'
+  if ($answer) { return (Resolve-ApkSource $answer) }
+  $newest = Get-NewestDownload
+  if (-not $newest) { Warn 'В «Загрузках» нет APK-файлов.'; return $null }
+  Say "  Беру $($newest.Name) из «Загрузок»." 'DarkGray'
+  return $newest.FullName
+}
+
+# Компонент запуска приложения: пакет/класс, либо пусто, если такого экрана у приложения нет
+function Get-LaunchActivity([string]$Pkg, [string]$Category) {
+  $out = Sh "cmd package resolve-activity --brief -a android.intent.action.MAIN -c $Category -p $Pkg"
+  $pattern = '^' + [regex]::Escape($Pkg) + '/[\w.$]+$'
+  return (($out -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -cmatch $pattern } | Select-Object -Last 1)
+}
+
+# Появится ли приложение на экране телевизора. Приложения для телефона на ТВ ставятся, но значка
+# в списке приложений у них нет: без этой проверки кажется, что установка не удалась.
+function Show-AppAccess([string]$Pkg, [string]$Title) {
+  if (-not $Pkg -or $Pkg -cnotmatch $Script:SafePkg) {
+    Warn "Не удалось определить имя пакета $Title. Найдите его в Настройки → Приложения."
+    return
+  }
+  $component = Get-LaunchActivity $Pkg 'android.intent.category.LEANBACK_LAUNCHER'
+  if ($component) {
+    Ok "$Title появится в списке приложений на главном экране телевизора."
+  } else {
+    $component = Get-LaunchActivity $Pkg 'android.intent.category.LAUNCHER'
+    if (-not $component) {
+      Warn "У $Title нет экрана запуска — открыть его с телевизора нельзя."
+      return
+    }
+    Warn "$Title сделано для телефона: на ТВ оно установилось, но значка на главном экране у него не будет."
+    Say '    Открыть его можно отсюда. Постоянный значок даёт лаунчер, который показывает и обычные приложения;' 'DarkGray'
+    Say '    пультом такие приложения часто неудобны. Если есть версия для ТВ — лучше поставить её.' 'DarkGray'
+  }
+  if ($component -cnotmatch '^[\w.]+/[\w.$]+$') { return }
+  if (-not (Confirm "Открыть $Title на телевизоре сейчас?" $false)) { return }
+  $out = Sh "am start -n '$component'"
+  if ($out -match 'Error|Exception|does not exist') { Warn "Не открылось: $(Get-ShortError $out)" }
+  else { Ok "$Title запущено на телевизоре." }
+}
+
+function Install-UserApk([string]$File, $App) {
+  $name = Split-Path $File -Leaf
+  $problem = Get-ApkProblem $File
+  if ($problem) { Fail "$name`: $problem"; return }
+  $mb = [math]::Round((Get-Item -LiteralPath $File).Length / 1MB, 1)
+  Say "  Файл: $name, $mb МБ" 'White'
+  $certs = @(Get-ApkCertHashes $File)
+  if ($certs.Count) { Say "  Подпись издателя (SHA-256): $($certs[0])" 'DarkGray' }
+  else { Say '  Подпись издателя прочитать не удалось (старый формат подписи): её проверит Android при установке.' 'DarkGray' }
+  if ($App -and $App.cert) {
+    if ($certs -notcontains "$($App.cert)".ToLower()) {
+      Fail "$name`: подпись не совпала с подписью издателя ($($App.title)). Не устанавливаю."
+      return
+    }
+    Ok 'Подпись совпала с подписью издателя'
+  } else {
+    Say '  Подпись этого файла ЧистыйТВ с издателем не сверяет — ставьте приложения только из официальных источников.' 'Yellow'
+  }
+  $label = $name
+  if ($App) { $label = $App.title }
+  if (-not (Confirm "Установить $label на телевизор?")) { return }
+
+  $before = @(Get-InstalledPackages)
+  if (-not (Install-Apk $File $label)) { return }
+  $added = @(@(Get-InstalledPackages) | Where-Object { $before -notcontains $_ })
+
+  # Имя пакета: из каталога; для своего файла — то, что появилось на ТВ после установки (обновление ничего не добавляет)
+  $pkg = $null
+  if ($App) { $pkg = $App.package }
+  if ($added.Count -and (-not $pkg -or $added -notcontains $pkg)) {
+    if ($pkg) { Warn "Установился пакет $($added -join ', '), а не $pkg — проверьте, тот ли это файл." }
+    $pkg = $added[0]
+  }
+  if (-not $pkg) {
+    Ok 'Обновлено или переустановлено: имя пакета не определить, значок ищите в списке приложений ТВ.'
+    return
+  }
+  Show-AppAccess $pkg $label
+  Say '  Удалить приложение: Настройки → Приложения на телевизоре.' 'DarkGray'
+}
+
+function Invoke-InstallApp {
+  Title 'Установить приложение'
+  $app = $null
+  $file = $null
+  if ($ApkPath) { $file = Resolve-ApkSource $ApkPath }
+  elseif ($ApkUrl) { $file = Resolve-ApkSource $ApkUrl }
+  elseif ($Yes) { Fail 'Укажите APK: -ApkPath "C:\папка\app.apk" или -ApkUrl "https://…/app.apk".'; return }
+  else {
+    $apps = @(Load-Apps)
+    Say '  Любое приложение ставится из APK-файла. Что ставим?' 'White'
+    for ($i = 0; $i -lt $apps.Count; $i++) {
+      Say ("    {0}. {1} — {2}" -f ($i + 1), $apps[$i].title, $apps[$i].note)
+    }
+    Say '    Или вставьте путь к APK на компьютере либо ссылку https://… Enter — самый свежий APK из «Загрузок».' 'DarkGray'
+    $answer = Ask 'Номер, путь или ссылка'
+    if ($answer -match '^\d+$') {
+      $idx = [int]$answer - 1
+      if ($idx -lt 0 -or $idx -ge $apps.Count) { Warn 'Нет такого номера'; return }
+      $app = $apps[$idx]
+      if ($Script:Info.Installed -contains $app.package) {
+        Ok "$($app.title) уже установлен"
+        if (-not (Confirm 'Поставить поверх (обновить из файла)?' $false)) { Show-AppAccess $app.package $app.title; return }
+      }
+      $file = Get-CatalogApk $app
+    } elseif ($answer) {
+      $file = Resolve-ApkSource $answer
+    } else {
+      $newest = Get-NewestDownload
+      if (-not $newest) { Warn 'В «Загрузках» нет APK-файлов.'; return }
+      Say "  Беру $($newest.Name) из «Загрузок»." 'DarkGray'
+      $file = $newest.FullName
+    }
+  }
+  if (-not $file) { return }
+  Install-UserApk $file $app
+}
+
 # ─── Отчёт ───────────────────────────────────────────────────────────────
 
 # В сообщениях об ошибках бывают адреса, ссылка подписки и пути: в отчёт они не идут
@@ -1188,6 +1416,7 @@ function Show-Menu {
     Say '  4. Блокировка рекламы через DNS'
     Say '  5. Вернуть как было'
     Say '  6. Отчёт о телевизоре (что-то не получилось? соберёт данные для разработчика)'
+    Say '  7. Установить приложение (ВКонтакте, любое другое — из APK-файла)'
     Say '  0. Выход'
     switch (Ask 'Пункт' '1') {
       '1' { Invoke-Clean }
@@ -1196,6 +1425,7 @@ function Show-Menu {
       '4' { Invoke-Dns }
       '5' { Invoke-Restore }
       '6' { Invoke-Report }
+      '7' { Invoke-InstallApp }
       '0' { return }
       default { Warn 'Нет такого пункта' }
     }
@@ -1230,6 +1460,7 @@ function Main {
     'launcher' { Invoke-Launcher }
     'dns' { Invoke-Dns }
     'report' { Invoke-Report }
+    'app' { Invoke-InstallApp }
     'info' { }
   }
   Show-Finish

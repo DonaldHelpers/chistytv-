@@ -83,11 +83,12 @@ switch ($argv[0]) {
       return
     }
     if ($cmd -match '^pm install -r ') {
-      $pkg = if ($state.pushed_file -eq 'CleanYourTV-Launcher-3.6.apk') { 'com.gathin.tvhome' } else { 'com.installed.by.test' }
+      $pkg = if ($state.pushed_file -eq 'CleanYourTV-Launcher-3.6.apk') { 'com.gathin.tvhome' } elseif ($state.install_as) { $state.install_as } else { 'com.installed.by.test' }
       $state.installed = @($state.installed) + $pkg | Select-Object -Unique
       Save
       'Success'; return
     }
+    if ($cmd -match '^cmd package resolve-activity .*-c android\.intent\.category\.LEANBACK_LAUNCHER -p (\S+)' -and @($state.phone_only) -contains $Matches[1]) { 'No activity found'; return }
     if ($cmd -match '^cmd package resolve-activity .*-p (\S+)') {
       $p = $Matches[1]
       if ($state.installed -contains $p) { "priority=0 preferredOrder=0`n$p/$p.MainActivity" } else { 'No activity found' }

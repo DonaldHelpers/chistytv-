@@ -398,6 +398,63 @@ $env:USERPROFILE = $realProfile
 $src = [IO.File]::ReadAllText((Join-Path $root 'src\main.ps1'), [Text.Encoding]::UTF8)
 Check 'в скрипте нет обхода защиты из базы' ($src -notmatch 'override_protect')
 
+# 12д. Установка любого приложения (пункт «Установить приложение»)
+function New-FakeApk([string]$Path, [string[]]$Entries = @('AndroidManifest.xml', 'classes.dex')) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  if (Test-Path $Path) { Remove-Item $Path -Force }
+  $z = [IO.Compression.ZipFile]::Open($Path, 'Create')
+  foreach ($n in $Entries) { $e = $z.CreateEntry($n); $w = New-Object IO.StreamWriter($e.Open()); $w.Write('x'); $w.Dispose() }
+  $z.Dispose()
+}
+$appsDir = Join-Path $tmp 'apps'
+New-Item -ItemType Directory -Path $appsDir | Out-Null
+$goodApk = Join-Path $appsDir 'vk.apk'
+New-FakeApk $goodApk
+$tv = New-Tv @('com.android.settings') @{ install_as = 'com.test.vk'; phone_only = @('com.test.vk') }
+$out = Run @('-Action', 'app', '-ApkPath', $goodApk, '-Yes')
+$s = State $tv
+Check 'приложение из APK установлено' (@($s.installed) -contains 'com.test.vk') $out
+Check 'для приложения-телефонного типа предупредили про значок' ($out -match 'сделано для телефона') $out
+
+$tv = New-Tv @('com.android.settings') @{ install_as = 'com.test.tvapp' }
+$out = Run @('-Action', 'app', '-ApkPath', "`"$goodApk`"", '-Yes')
+Check 'путь в кавычках принимается; у ТВ-приложения есть значок' ((@((State $tv).installed) -contains 'com.test.tvapp') -and $out -match 'появится в списке приложений') $out
+
+$tv = New-Tv @('com.android.settings')
+$bundle = Join-Path $appsDir 'bundle.xapk'
+New-FakeApk $bundle @('manifest.json', 'base.apk')
+$out = Run @('-Action', 'app', '-ApkPath', $bundle, '-Yes')
+Check 'набор .xapk отклонён, на ТВ ничего не передано' ((-not (State $tv).pushed_file) -and $out -match 'набор файлов') $out
+
+$notApk = Join-Path $appsDir 'readme.apk'
+[IO.File]::WriteAllText($notApk, 'not a zip')
+$out = Run @('-Action', 'app', '-ApkPath', $notApk, '-Yes')
+Check 'не-APK отклонён до отправки на ТВ' ((-not (State $tv).pushed_file) -and $out -match 'повреждён') $out
+
+$out = Run @('-Action', 'app', '-ApkPath', (Join-Path $appsDir 'missing.apk'), '-Yes')
+Check 'несуществующий файл — понятная ошибка' ($out -match 'Не нашёл файл') $out
+
+$out = Run @('-Action', 'app', '-ApkUrl', 'http://example.com/a.apk', '-Yes')
+Check 'ссылки http:// не принимаются' ($out -match 'http://') $out
+
+$out = Run @('-Action', 'app', '-Yes')
+Check 'без APK в режиме -Yes — подсказка, а не падение' ($out -match '-ApkPath') $out
+
+# Каталог: выбор по номеру, файл берётся из «Загрузок»; подпись из каталога обязательна
+$realProfile = $env:USERPROFILE
+$env:USERPROFILE = Join-Path $tmp 'appprofile'
+New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE 'Downloads') | Out-Null
+Copy-Item $goodApk (Join-Path $env:USERPROFILE 'Downloads\com.test.vk-1.0.apk')
+$tv = New-Tv @('com.android.settings') @{ install_as = 'com.test.vk' }
+$out = RunWithInput "1`n`nn`n" @('-Action', 'app')
+Check 'каталог: файл найден в «Загрузках» и установлен' ((@((State $tv).installed) -contains 'com.test.vk') -and $out -match 'Нашёл com\.test\.vk-1\.0\.apk') $out
+
+Copy-Item $goodApk (Join-Path $env:USERPROFILE 'Downloads\com.test.pinned-1.0.apk')
+$tv = New-Tv @('com.android.settings') @{ install_as = 'com.test.pinned' }
+$out = RunWithInput "2`ny`n" @('-Action', 'app')
+Check 'каталог: чужая подпись не проходит, установка не выполняется' ((-not (State $tv).pushed_file) -and $out -match 'подпись не совпала') $out
+$env:USERPROFILE = $realProfile
+
 # 13. Запуск «irm | iex»: загрузчик без BOM и только ASCII, иначе PowerShell не поймёт блок param
 $launcher = [IO.File]::ReadAllBytes($script)
 Check 'chistytv.ps1 без BOM' (-not ($launcher[0] -eq 0xEF -and $launcher[1] -eq 0xBB -and $launcher[2] -eq 0xBF))

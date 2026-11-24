@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "apps": [
+    {
+      "id": "phone",
+      "title": "Тестовое приложение для телефона",
+      "package": "com.test.vk",
+      "page": "https://example.com/vk",
+      "note": "без значка на главном экране"
+    },
+    {
+      "id": "pinned",
+      "title": "Тестовое приложение с подписью",
+      "package": "com.test.pinned",
+      "page": "https://example.com/pinned",
+      "cert": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}
