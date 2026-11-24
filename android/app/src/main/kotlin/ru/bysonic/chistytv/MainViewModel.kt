@@ -466,12 +466,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         out.fail("Не удалось прочитать файл: ${e.message ?: e.javaClass.simpleName}")
         return@op
       }
+      // Выбор файла уводит на другой экран, и ADB-соединение к этому моменту может быть мёртвым.
+      // Happ такой проверки не делает, а мы переподключаемся сами, как перед установкой Happ.
+      if (connection?.connected != true) {
+        out.info("Соединение с телевизором неактивно — переподключаюсь…")
+        val ok = runCatching { reconnectQuietly() }.getOrDefault(false)
+        if (!ok || connection?.connected != true) {
+          out.fail("Не удалось переподключиться к телевизору. Вернитесь на главный экран, подключитесь заново и повторите.")
+          file.delete()
+          return@op
+        }
+        out.ok("Переподключился к телевизору.")
+      }
       try {
         appResult = installUserApk(file, displayName, app)
       } finally {
         file.delete()
       }
     }
+  }
+
+  /** Переподключиться к тому же телевизору тем же способом; сессия остаётся прежней */
+  private fun reconnectQuietly(): Boolean {
+    val c = connection ?: return false
+    val address = c.address ?: prefs.getString("last_address", null) ?: return false
+    val (host, port) = parseAddress(address) ?: return false
+    return c.connect(host, port, prefs.getBoolean("last_tls", false))
   }
 
   fun launchInstalledApp(pkg: String) = op(clearLog = false) { launchApp(pkg) }
