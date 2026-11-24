@@ -8,6 +8,9 @@ on:
     paths: ['android/**', 'data/**', '.github/workflows/android.yml']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,3 +33,13 @@ jobs:
         with:
           name: ChistyTV-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+      - name: Выложить APK в Releases
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/*.apk ChistyTV.apk
+          gh release delete latest-apk --cleanup-tag --yes || true
+          gh release create latest-apk ChistyTV.apk --prerelease --target "$GITHUB_SHA" \
+            --title "ChistyTV: свежая сборка" \
+            --notes "Отладочная сборка из ветки main. Скачайте ChistyTV.apk и установите на телефон."
