@@ -56,6 +56,9 @@ class FakeTv(
   /** Какой пакет появится после pm install -r (по умолчанию — com.installed.by.test) */
   var installAs: String? = null
 
+  /** Сколько файлов было в каждом pm install-multiple */
+  val multiInstalls = mutableListOf<Int>()
+
   /** Приложения для телефона: есть LAUNCHER, но нет LEANBACK_LAUNCHER */
   val phoneOnly = mutableSetOf<String>()
 
@@ -124,6 +127,12 @@ class FakeTv(
     if (c.startsWith("pm install -r ") && needMb != null && (freeMb ?: 0) < needMb!!) {
       return "\nException occurred while executing:\nandroid.os.ParcelableException: java.io.IOException: Requested internal only, but not enough space\n" +
         "\tat android.util.ExceptionUtils.wrap(ExceptionUtils.java:34)\n\tat com.android.server.pm.PackageInstallerService.createSession(PackageInstallerService.java:536)"
+    }
+    if (c.startsWith("pm install-multiple -r ")) {
+      val pkg = installAs ?: "com.installed.by.test"
+      if (pkg !in installed) installed += pkg
+      multiInstalls += c.removePrefix("pm install-multiple -r ").split(" ").size
+      return "Success"
     }
     if (c.startsWith("pm install -r ")) {
       val pkg = installAs ?: "com.installed.by.test"

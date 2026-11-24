@@ -1,12 +1,13 @@
 package ru.bysonic.chistytv.ui
 
+import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -54,6 +55,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -65,6 +67,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -384,6 +387,22 @@ private fun displayName(context: Context, uri: Uri): String {
   return fromProvider ?: uri.lastPathSegment?.substringAfterLast('/') ?: "app.apk"
 }
 
+/**
+ * Выбор файла через файловый менеджер телефона: «Получить контент» показывает список приложений
+ * (Файлы, ваш файловый менеджер…), а EXTRA_LOCAL_ONLY прячет облачные хранилища вроде Google Диска.
+ */
+private class PickApk : ActivityResultContract<Unit, Uri?>() {
+  override fun createIntent(context: Context, input: Unit): Intent {
+    val get = Intent(Intent.ACTION_GET_CONTENT)
+      .setType("*/*")
+      .addCategory(Intent.CATEGORY_OPENABLE)
+      .putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+    return Intent.createChooser(get, "Выберите APK в файловом менеджере")
+  }
+
+  override fun parseResult(resultCode: Int, intent: Intent?): Uri? = if (resultCode == Activity.RESULT_OK) intent?.data else null
+}
+
 @Composable
 fun InstallAppScreen(vm: MainViewModel) {
   if (vm.session == null) return
@@ -391,18 +410,24 @@ fun InstallAppScreen(vm: MainViewModel) {
   val context = LocalContext.current
   // Какое приложение каталога выбрал человек; null — «другое»: тогда пакет определим по тому, что появилось на ТВ
   var targetId by rememberSaveable { mutableStateOf<String?>(null) }
-  val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+  // Передача большого файла занимает минуты: пока идёт установка, экран не гаснет
+  val view = LocalView.current
+  DisposableEffect(vm.busy) {
+    view.keepScreenOn = vm.busy
+    onDispose { view.keepScreenOn = false }
+  }
+  val picker = rememberLauncherForActivityResult(PickApk()) { uri ->
     if (uri != null) vm.installApkFromUri(uri, displayName(context, uri), vm.apps.firstOrNull { it.id == targetId })
   }
   fun pick(app: AppEntry?) {
     targetId = app?.id
-    picker.launch(arrayOf("*/*"))
+    picker.launch(Unit)
   }
   val result = vm.appResult
   ActionScaffold("Установить приложение", vm) {
     Header(
       Icons.Rounded.Apps, Accent.Apps, "Установить приложение",
-      "Скачайте APK на телефон с официальной страницы, затем выберите файл: ЧистыйТВ проверит его и по Wi-Fi поставит на телевизор.",
+      "Скачайте APK на телефон с официальной страницы, затем выберите файл в файловом менеджере: ЧистыйТВ проверит его и по Wi-Fi поставит на телевизор. Большие приложения передаются несколько минут.",
     )
     vm.apps.forEach { app ->
       val installed = app.pkg in installedNow
@@ -427,7 +452,7 @@ fun InstallAppScreen(vm: MainViewModel) {
     GlassCard(Modifier.fillMaxWidth()) {
       Text("Другое приложение", style = MaterialTheme.typography.titleMedium, color = C.Text)
       Spacer(Modifier.height(4.dp))
-      Text("Любой обычный .apk из памяти телефона. Наборы .xapk, .apks и .apkm ADB не ставит.", style = MaterialTheme.typography.bodySmall, color = C.TextDim)
+      Text("Любой .apk, а также наборы .xapk, .apks, .apkm из памяти телефона. В списке выберите файловый менеджер.", style = MaterialTheme.typography.bodySmall, color = C.TextDim)
       Spacer(Modifier.height(12.dp))
       GradientButton("Выбрать APK-файл", { pick(null) }, Modifier.fillMaxWidth(), Icons.Rounded.FolderOpen, enabled = !vm.busy, loading = vm.busy && targetId == null)
     }

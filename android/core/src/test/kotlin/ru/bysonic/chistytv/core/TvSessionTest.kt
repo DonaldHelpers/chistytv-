@@ -637,16 +637,45 @@ class TvSessionTest {
   }
 
   @Test
-  fun `набор xapk и не-APK отклоняются до отправки на телевизор`() {
+  fun `не-APK отклоняются до отправки на телевизор`() {
     val tv = FakeTv(listOf("com.android.settings"))
     val r = run(tv)
-    val bundle = fakeApk(r, "bundle.xapk", listOf("manifest.json", "base.apk"))
-    assertFalse(r.session.installUserApk(bundle, "bundle.xapk").installed)
     val junk = File(r.root, "readme.apk").apply { writeText("not a zip") }
     assertFalse(r.session.installUserApk(junk, "readme.apk").installed)
     val noManifest = fakeApk(r, "empty.apk", listOf("classes.dex"))
     assertFalse(r.session.installUserApk(noManifest, "empty.apk").installed)
-    assertTrue(r.text, tv.pushed.isEmpty() && r.text.contains("набор файлов") && r.text.contains("повреждён") && r.text.contains("нет AndroidManifest.xml"))
+    val emptyBundle = fakeApk(r, "none.xapk", listOf("manifest.json", "icon.png"))
+    assertFalse(r.session.installUserApk(emptyBundle, "none.xapk").installed)
+    assertTrue(r.text, tv.pushed.isEmpty() && r.text.contains("повреждён") && r.text.contains("нет AndroidManifest.xml") && r.text.contains("нет ни одного APK"))
+  }
+
+  @Test
+  fun `набор xapk ставится через install-multiple, части под чужой процессор отбрасываются`() {
+    val tv = FakeTv(listOf("com.android.settings")).apply { installAs = "com.test.bundle" }
+    val r = run(tv)
+    val bundle = fakeApk(r, "bundle.xapk", listOf("manifest.json", "base.apk", "config.armeabi_v7a.apk", "config.x86.apk", "config.ru.apk"))
+    val res = r.session.installUserApk(bundle, "bundle.xapk")
+    assertTrue(r.text, res.installed && "com.test.bundle" in tv.installed)
+    assertEquals(r.text, listOf(3), tv.multiInstalls) // base + armeabi_v7a + ru; x86 отброшен
+    assertEquals(3, tv.pushed.size)
+  }
+
+  @Test
+  fun `обрыв связи при передаче — честная ошибка, а не молчание`() {
+    val base = FakeTv(listOf("com.android.settings"))
+    val tv = object : Adb {
+      override fun push(source: File, remotePath: String) {
+        throw IOException("Broken pipe")
+      }
+      override fun shell(command: String): String = if (command == "echo ok") throw IOException("связь с телевизором потеряна") else base.shell(command)
+    }
+    val r = run(tv)
+    try {
+      r.session.installUserApk(fakeApk(r), "big.apk")
+      org.junit.Assert.fail("нужно исключение «связь потеряна»")
+    } catch (e: IOException) {
+      assertTrue(e.message.orEmpty(), e.message.orEmpty().contains("Broken pipe"))
+    }
   }
 
   @Test

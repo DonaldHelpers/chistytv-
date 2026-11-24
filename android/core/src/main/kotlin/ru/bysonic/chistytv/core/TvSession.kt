@@ -170,24 +170,44 @@ class TvSession(
     if (before != null && after != null) out.info("Кэш приложений очищен: свободно $after МБ (было $before МБ).")
   }
 
-  /** Передать и поставить; ошибка передачи — строка с «push: » */
-  private fun sendApk(file: File, remote: String): String {
+  private fun cleanRemote(remote: List<String>) {
+    for (p in remote) runCatching { adb.shell("rm -f $p") }
+  }
+
+  /**
+   * Передать и поставить; ошибка передачи — строка с «push: ». Если при этом оборвалась связь с телевизором,
+   * бросаем IOException, чтобы приложение показало «Связь потеряна», а не пряталось за общим «не установилось».
+   */
+  private fun sendApks(files: List<File>, remote: List<String>): String {
     try {
-      adb.push(file, remote)
+      files.forEachIndexed { i, f -> adb.push(f, remote[i]) }
     } catch (e: Exception) {
-      adb.shell("rm -f $remote")
-      return "push: ${e.message}"
+      val alive = runCatching { adb.shell("echo ok") }.isSuccess
+      cleanRemote(remote)
+      if (!alive) throw IOException("связь с телевизором потеряна во время передачи файла: ${e.message ?: e.javaClass.simpleName}", e)
+      return "push: ${e.message ?: e.javaClass.simpleName}"
     }
-    val r = adb.shell("pm install -r $remote")
-    adb.shell("rm -f $remote")
+    val r = try {
+      adb.shell(if (files.size == 1) "pm install -r ${remote[0]}" else "pm install-multiple -r ${remote.joinToString(" ")}")
+    } catch (e: IOException) {
+      cleanRemote(remote)
+      out.fail("Связь с телевизором оборвалась во время установки: ${e.message ?: e.javaClass.simpleName}")
+      out.hint("Так бывает, когда телевизору не хватает оперативной памяти на большое приложение: он перезапускает систему. Подождите, пока ТВ загрузится, и подключитесь снова.")
+      throw e
+    }
+    cleanRemote(remote)
     return r
   }
 
-  fun installApk(file: File, label: String): Boolean {
+  fun installApk(file: File, label: String): Boolean = installFiles(listOf(file), label)
+
+  /** Один APK или набор из нескольких (split APK: pm install-multiple) */
+  private fun installFiles(files: List<File>, label: String): Boolean {
     // push + pm install: на Android 14 «adb install» может зависнуть, ожидая подтверждения на экране
-    val remote = "/data/local/tmp/chistytv.apk"
+    val remote = if (files.size == 1) listOf("/data/local/tmp/chistytv.apk") else files.indices.map { "/data/local/tmp/chistytv-$it.apk" }
+    val total = files.sumOf { it.length() }
     // Место с запасом: APK лежит во временной папке, при установке копируется и распаковывается
-    val needMb = (file.length() * 3 + 1024 * 1024 - 1) / (1024 * 1024) + 50
+    val needMb = (total * 3 + 1024 * 1024 - 1) / (1024 * 1024) + 50
     var trimmed = false
     val free = freeMb()
     if (free != null && free < needMb) {
@@ -195,18 +215,25 @@ class TvSession(
       clearTvCache()
       trimmed = true
     }
-    var r = sendApk(file, remote)
+    if (total > 50L * 1024 * 1024) {
+      out.info("Передаю ${total / (1024 * 1024)} МБ на телевизор — это может занять несколько минут. Не выключайте экран телефона и не закрывайте приложение.")
+    }
+    var r = sendApks(files, remote)
     if (NO_SPACE.containsMatchIn(r) && !trimmed) {
       out.warn("На телевизоре не хватило памяти — очищаю кэш приложений и пробую ещё раз…")
       clearTvCache()
-      r = sendApk(file, remote)
+      r = sendApks(files, remote)
     }
     if (r.contains("Success")) {
       out.ok("$label установлен")
       return true
     }
-    if (r.startsWith("push: ")) out.fail("Не удалось передать $label: ${shortError(r.removePrefix("push: "))}")
-    else out.fail("$label не установился: ${shortError(r)}")
+    if (r.startsWith("push: ")) {
+      out.fail("Не удалось передать $label: ${shortError(r.removePrefix("push: "))}")
+      out.hint("Если связь оборвалась на середине: проверьте, что телефон и ТВ в одной Wi-Fi сети, и повторите. Большие приложения (сотни МБ) ТВ с малой памятью может не потянуть.")
+    } else {
+      out.fail("$label не установился: ${shortError(r)}")
+    }
     if (NO_SPACE.containsMatchIn(r)) {
       val now = freeMb()?.let { "свободно $it МБ, " }.orEmpty()
       out.hint("Во внутренней памяти телевизора не хватает места даже после очистки кэша (${now}нужно около $needMb МБ).")
@@ -214,7 +241,7 @@ class TvSession(
     }
     if (r.contains("VERIFICATION_FAILURE")) out.hint("Прошивка запрещает установку сторонних приложений по ADB.")
     if (r.contains("NO_MATCHING_ABIS")) out.hint("У $label нет сборки под процессор этого телевизора (${info.abiList}).")
-    if (r.contains("MISSING_SPLIT")) out.hint("Это часть приложения из набора (split APK): одного файла мало. Нужен полный .apk.")
+    if (r.contains("MISSING_SPLIT")) out.hint("Это часть приложения из набора (split APK): одного файла мало. Нужен полный .apk или набор целиком.")
     if (r.contains("OLDER_SDK")) out.hint("$label требует более новый Android, чем на этом телевизоре (Android ${info.android}).")
     if (Regex("INCONSISTENT_CERTIFICATES|UPDATE_INCOMPATIBLE").containsMatchIn(r)) {
       out.hint("На ТВ уже стоит $label с другой подписью. Удалите его (Настройки → Приложения → $label → Удалить) и поставьте этот файл.")
@@ -294,13 +321,45 @@ class TvSession(
   fun installUserApk(file: File, displayName: String, app: AppEntry? = null): AppInstall {
     val label = app?.title ?: displayName
     val failed = AppInstall(false, app?.pkg, AppAccess.UNKNOWN)
-    ApkCheck.problem(file, displayName)?.let {
-      out.fail("$displayName: $it")
-      return failed
+    val workDir = File(file.absoluteFile.parentFile, "bundle-${System.nanoTime()}")
+    try {
+      val files: List<File> = when (val kind = ApkCheck.inspect(file, displayName)) {
+        is ApkCheck.Kind.Invalid -> {
+          out.fail("$displayName: ${kind.reason}")
+          return failed
+        }
+        is ApkCheck.Kind.Single -> listOf(file)
+        is ApkCheck.Kind.Bundle -> {
+          val picked = ApkCheck.pickSplits(kind.apks, info.abiList)
+          if (picked.isEmpty()) {
+            out.fail("$displayName: в наборе нет файлов под процессор этого телевизора (${info.abiList}).")
+            return failed
+          }
+          out.info("Набор из ${kind.apks.size} файлов, для этого телевизора нужны ${picked.size}.")
+          // Основной файл — первым: части конфигурации (config.*, split_*) идут после него
+          val ordered = picked.sortedBy { path ->
+            val n = path.substringAfterLast('/').lowercase()
+            if (n.startsWith("config.") || n.startsWith("split_")) 1 else 0
+          }
+          try {
+            ApkCheck.extract(file, ordered, workDir)
+          } catch (e: IOException) {
+            out.fail("$displayName: не удалось распаковать набор: ${e.message}")
+            return failed
+          }
+        }
+      }
+      return installChecked(files, displayName, label, app, failed)
+    } finally {
+      workDir.deleteRecursively()
     }
-    val mb = (file.length() * 10 / (1024 * 1024)) / 10.0
+  }
+
+  private fun installChecked(files: List<File>, displayName: String, label: String, app: AppEntry?, failed: AppInstall): AppInstall {
+    val total = files.sumOf { it.length() }
+    val mb = (total * 10 / (1024 * 1024)) / 10.0
     out.info("Файл: $displayName, $mb МБ")
-    val certs = ApkSignature.certHashes(file)
+    val certs = files.flatMap { ApkSignature.certHashes(it) }.toSet()
     if (certs.isNotEmpty()) out.info("Подпись издателя (SHA-256): ${certs.first()}")
     else out.info("Подпись издателя прочитать не удалось (старый формат подписи): её проверит Android при установке.")
     val pinned = app?.cert
@@ -315,7 +374,7 @@ class TvSession(
     }
 
     val before = refresh().installed
-    if (!installApk(file, label)) return failed
+    if (!installFiles(files, label)) return failed
     val added = refresh().installed - before
     // Имя пакета: из каталога; для своего файла — то, что появилось на ТВ после установки (обновление ничего не добавляет)
     var pkg = app?.pkg
