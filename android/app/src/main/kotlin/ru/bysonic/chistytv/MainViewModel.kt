@@ -2,6 +2,7 @@ package ru.bysonic.chistytv
 
 import android.app.Application
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -23,6 +24,8 @@ import ru.bysonic.chistytv.adb.Discovery
 import ru.bysonic.chistytv.adb.FoundTv
 import ru.bysonic.chistytv.adb.TvConnection
 import ru.bysonic.chistytv.core.ApkCache
+import ru.bysonic.chistytv.core.AppCatalog
+import ru.bysonic.chistytv.core.AppEntry
 import ru.bysonic.chistytv.core.Db
 import ru.bysonic.chistytv.core.HttpNet
 import ru.bysonic.chistytv.core.Line
@@ -37,7 +40,7 @@ import java.io.IOException
 
 private const val TAG = "ChistyTV"
 
-enum class Screen { Start, Search, Pair, Connecting, Home, Clean, YouTube, Launcher, Dns, Restore, Report }
+enum class Screen { Start, Search, Pair, Connecting, Home, Clean, YouTube, Launcher, Dns, Restore, Report, InstallApp }
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
   private val ctx: Context get() = getApplication()
@@ -104,6 +107,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
   init {
     refreshDb()
   }
+
+  // ─── Каталог приложений для установки (data/apps.json лежит в assets рядом с packages.json) ──
+
+  val apps: List<AppEntry> = runCatching {
+    AppCatalog.parse(ctx.assets.open("apps.json").use { it.readBytes().toString(Charsets.UTF_8) }).apps
+  }.getOrDefault(emptyList())
 
   // ─── Поиск телевизора ───────────────────────────────────────────────
 
@@ -352,6 +361,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private set
   var journal by mutableStateOf<List<String>>(emptyList())
     private set
+  var appResult by mutableStateOf<TvSession.AppInstall?>(null)
+    private set
 
   private fun resetOperation() {
     log.clear()
@@ -362,6 +373,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     hardResult = null
     happResult = null
     webImportSent = false
+    appResult = null
   }
 
   private fun op(clearLog: Boolean = true, block: TvSession.() -> Unit) {
@@ -439,6 +451,30 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
   fun sendSubscription(url: String) = op(clearLog = false) { happResult = sendHappSubscription(url.trim()) }
 
   fun webImport(code: String, url: String) = op(clearLog = false) { webImportSent = happWebImport(code.trim(), url.trim()) }
+
+  /** Установить APK, выбранный в памяти телефона. app — запись каталога, если человек выбрал приложение из списка */
+  fun installApkFromUri(uri: Uri, displayName: String, app: AppEntry?) {
+    appResult = null
+    op {
+      val dir = File(ctx.cacheDir, "apk").apply { mkdirs() }
+      val file = File(dir, "user-selected.apk")
+      try {
+        val input = ctx.contentResolver.openInputStream(uri) ?: throw IOException("файл недоступен")
+        input.use { i -> file.outputStream().use { o -> i.copyTo(o) } }
+      } catch (e: Exception) {
+        file.delete()
+        out.fail("Не удалось прочитать файл: ${e.message ?: e.javaClass.simpleName}")
+        return@op
+      }
+      try {
+        appResult = installUserApk(file, displayName, app)
+      } finally {
+        file.delete()
+      }
+    }
+  }
+
+  fun launchInstalledApp(pkg: String) = op(clearLog = false) { launchApp(pkg) }
 
   fun makeHome() = op {
     if (!launcherInstalled && !installLauncher()) return@op

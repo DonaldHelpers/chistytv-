@@ -14,7 +14,7 @@ import ru.bysonic.chistytv.Screen
 
 private val depth = mapOf(
   Screen.Start to 0, Screen.Search to 1, Screen.Pair to 2, Screen.Connecting to 3, Screen.Home to 4,
-  Screen.Clean to 5, Screen.YouTube to 5, Screen.Launcher to 5, Screen.Dns to 5, Screen.Restore to 5,
+  Screen.Clean to 5, Screen.YouTube to 5, Screen.Launcher to 5, Screen.Dns to 5, Screen.Restore to 5, Screen.InstallApp to 5,
 )
 
 @Composable
@@ -43,6 +43,7 @@ fun ChistyApp(vm: MainViewModel, finish: () -> Unit) {
         Screen.Dns -> DnsScreen(vm)
         Screen.Restore -> RestoreScreen(vm)
         Screen.Report -> ReportScreen(vm)
+        Screen.InstallApp -> InstallAppScreen(vm)
       }
     }
   }

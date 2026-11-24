@@ -53,6 +53,12 @@ class FakeTv(
   var needMb: Long? = null
   var trimmed = false
 
+  /** Какой пакет появится после pm install -r (по умолчанию — com.installed.by.test) */
+  var installAs: String? = null
+
+  /** Приложения для телефона: есть LAUNCHER, но нет LEANBACK_LAUNCHER */
+  val phoneOnly = mutableSetOf<String>()
+
   override fun push(source: File, remotePath: String) {
     pushed += remotePath
   }
@@ -120,8 +126,12 @@ class FakeTv(
         "\tat android.util.ExceptionUtils.wrap(ExceptionUtils.java:34)\n\tat com.android.server.pm.PackageInstallerService.createSession(PackageInstallerService.java:536)"
     }
     if (c.startsWith("pm install -r ")) {
-      if ("com.installed.by.test" !in installed) installed += "com.installed.by.test"
+      val pkg = installAs ?: "com.installed.by.test"
+      if (pkg !in installed) installed += pkg
       return "Success"
+    }
+    Regex("^cmd package resolve-activity .*-c android\\.intent\\.category\\.LEANBACK_LAUNCHER -p (\\S+)").find(c)?.let {
+      if (it.groupValues[1] in phoneOnly) return "No activity found"
     }
     Regex("^cmd package resolve-activity .*-p (\\S+)").find(c)?.let {
       val p = it.groupValues[1]

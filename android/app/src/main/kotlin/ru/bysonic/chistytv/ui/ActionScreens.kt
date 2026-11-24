@@ -4,6 +4,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -26,12 +29,16 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.BugReport
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.Dashboard
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.FolderOpen
+import androidx.compose.material.icons.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material.icons.rounded.Send
 import androidx.compose.material.icons.rounded.Shield
@@ -63,6 +70,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import ru.bysonic.chistytv.MainViewModel
 import ru.bysonic.chistytv.Screen
+import ru.bysonic.chistytv.core.AppEntry
 import ru.bysonic.chistytv.core.PackageEntry
 import ru.bysonic.chistytv.core.TvSession
 import ru.bysonic.chistytv.ui.theme.Accent
@@ -360,6 +368,80 @@ fun RestoreScreen(vm: MainViewModel) {
       Spacer(Modifier.height(14.dp))
     }
     LogPanel(if (r == null && !vm.busy) emptyList() else vm.log, vm.busy)
+    Spacer(Modifier.height(16.dp))
+  }
+}
+
+// ─── Установка приложений ───────────────────────────────────────────────
+
+/** Имя файла, как его видит человек: у файла из памяти телефона имя на диске своё */
+private fun displayName(context: Context, uri: Uri): String {
+  val fromProvider = runCatching {
+    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+      if (c.moveToFirst()) c.getString(0) else null
+    }
+  }.getOrNull()
+  return fromProvider ?: uri.lastPathSegment?.substringAfterLast('/') ?: "app.apk"
+}
+
+@Composable
+fun InstallAppScreen(vm: MainViewModel) {
+  if (vm.session == null) return
+  val installedNow = vm.info?.installed.orEmpty()
+  val context = LocalContext.current
+  // Какое приложение каталога выбрал человек; null — «другое»: тогда пакет определим по тому, что появилось на ТВ
+  var targetId by rememberSaveable { mutableStateOf<String?>(null) }
+  val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    if (uri != null) vm.installApkFromUri(uri, displayName(context, uri), vm.apps.firstOrNull { it.id == targetId })
+  }
+  fun pick(app: AppEntry?) {
+    targetId = app?.id
+    picker.launch(arrayOf("*/*"))
+  }
+  val result = vm.appResult
+  ActionScaffold("Установить приложение", vm) {
+    Header(
+      Icons.Rounded.Apps, Accent.Apps, "Установить приложение",
+      "Скачайте APK на телефон с официальной страницы, затем выберите файл: ЧистыйТВ проверит его и по Wi-Fi поставит на телевизор.",
+    )
+    vm.apps.forEach { app ->
+      val installed = app.pkg in installedNow
+      GlassCard(Modifier.fillMaxWidth(), border = if (installed) SolidColor(C.Ok.copy(alpha = 0.45f)) else null) {
+        Text(app.title, style = MaterialTheme.typography.titleMedium, color = C.Text)
+        if (installed) Text("Уже установлено — выбранный файл поставится поверх", style = MaterialTheme.typography.bodySmall, color = C.Ok)
+        if (app.note.isNotBlank()) {
+          Spacer(Modifier.height(4.dp))
+          Text(app.note, style = MaterialTheme.typography.bodySmall, color = C.TextDim)
+        }
+        Spacer(Modifier.height(12.dp))
+        if (app.page.isNotBlank()) {
+          GhostButton("Страница скачивания", {
+            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(app.page)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+          }, Modifier.fillMaxWidth(), Icons.Rounded.OpenInNew)
+          Spacer(Modifier.height(8.dp))
+        }
+        GradientButton("Выбрать скачанный APK", { pick(app) }, Modifier.fillMaxWidth(), Icons.Rounded.FolderOpen, enabled = !vm.busy, loading = vm.busy && targetId == app.id)
+      }
+      Spacer(Modifier.height(12.dp))
+    }
+    GlassCard(Modifier.fillMaxWidth()) {
+      Text("Другое приложение", style = MaterialTheme.typography.titleMedium, color = C.Text)
+      Spacer(Modifier.height(4.dp))
+      Text("Любой обычный .apk из памяти телефона. Наборы .xapk, .apks и .apkm ADB не ставит.", style = MaterialTheme.typography.bodySmall, color = C.TextDim)
+      Spacer(Modifier.height(12.dp))
+      GradientButton("Выбрать APK-файл", { pick(null) }, Modifier.fillMaxWidth(), Icons.Rounded.FolderOpen, enabled = !vm.busy, loading = vm.busy && targetId == null)
+    }
+    Spacer(Modifier.height(14.dp))
+    Hint("Ставьте приложения только из официальных источников: подпись издателя проверяется только у приложений из списка. Удалить приложение можно на ТВ: Настройки → Приложения.", Icons.Rounded.WarningAmber, C.Warn)
+    Spacer(Modifier.height(14.dp))
+    LogPanel(vm.log, vm.busy)
+    val pkg = result?.pkg
+    if (result?.installed == true && pkg != null &&
+      (result.access == TvSession.AppAccess.TV || result.access == TvSession.AppAccess.PHONE_ONLY)
+    ) {
+      Spacer(Modifier.height(12.dp))
+      GhostButton("Открыть на телевизоре", { vm.launchInstalledApp(pkg) }, Modifier.fillMaxWidth(), Icons.Rounded.PlayArrow, enabled = !vm.busy)
+    }
     Spacer(Modifier.height(16.dp))
   }
 }

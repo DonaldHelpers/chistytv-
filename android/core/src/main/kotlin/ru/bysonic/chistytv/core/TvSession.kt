@@ -214,7 +214,122 @@ class TvSession(
     }
     if (r.contains("VERIFICATION_FAILURE")) out.hint("Прошивка запрещает установку сторонних приложений по ADB.")
     if (r.contains("NO_MATCHING_ABIS")) out.hint("У $label нет сборки под процессор этого телевизора (${info.abiList}).")
+    if (r.contains("MISSING_SPLIT")) out.hint("Это часть приложения из набора (split APK): одного файла мало. Нужен полный .apk.")
+    if (r.contains("OLDER_SDK")) out.hint("$label требует более новый Android, чем на этом телевизоре (Android ${info.android}).")
+    if (Regex("INCONSISTENT_CERTIFICATES|UPDATE_INCOMPATIBLE").containsMatchIn(r)) {
+      out.hint("На ТВ уже стоит $label с другой подписью. Удалите его (Настройки → Приложения → $label → Удалить) и поставьте этот файл.")
+    }
+    if (r.contains("VERSION_DOWNGRADE")) out.hint("На ТВ уже стоит более новая версия этого приложения.")
     return false
+  }
+
+  // ─── Установка любого приложения из APK ─────────────────────────────
+
+  /** Появится ли приложение на экране телевизора */
+  enum class AppAccess {
+    /** Есть значок в списке приложений ТВ */
+    TV,
+
+    /** Сделано для телефона: стоит, но значка на главном экране нет */
+    PHONE_ONLY,
+
+    /** Нет экрана запуска вовсе */
+    NO_ACTIVITY,
+
+    /** Не удалось определить имя пакета */
+    UNKNOWN,
+  }
+
+  data class AppInstall(val installed: Boolean, val pkg: String?, val access: AppAccess)
+
+  private fun launchActivity(pkg: String, category: String): String? {
+    val r = adb.shell("cmd package resolve-activity --brief -a android.intent.action.MAIN -c $category -p $pkg")
+    val shape = Regex("^" + Regex.escape(pkg) + "/[\\w.$]+$")
+    return r.lines().map { it.trim() }.lastOrNull { shape.matches(it) }
+  }
+
+  /**
+   * Приложения для телефона на ТВ ставятся, но значка в списке приложений у них нет: без этой проверки
+   * кажется, что установка не удалась.
+   */
+  fun appAccess(pkg: String?, title: String): AppAccess {
+    if (pkg == null || !TvStore.SAFE_PKG.matches(pkg)) {
+      out.warn("Не удалось определить имя пакета $title. Найдите его в Настройки → Приложения.")
+      return AppAccess.UNKNOWN
+    }
+    if (launchActivity(pkg, "android.intent.category.LEANBACK_LAUNCHER") != null) {
+      out.ok("$title появится в списке приложений на главном экране телевизора.")
+      return AppAccess.TV
+    }
+    if (launchActivity(pkg, "android.intent.category.LAUNCHER") == null) {
+      out.warn("У $title нет экрана запуска — открыть его с телевизора нельзя.")
+      return AppAccess.NO_ACTIVITY
+    }
+    out.warn("$title сделано для телефона: на ТВ оно установилось, но значка на главном экране у него не будет.")
+    out.hint("Открыть его можно кнопкой ниже. Пультом такие приложения часто неудобны — если есть версия для ТВ, лучше поставить её.")
+    return AppAccess.PHONE_ONLY
+  }
+
+  /** Открыть приложение на телевизоре */
+  fun launchApp(pkg: String): Boolean {
+    val component = launchActivity(pkg, "android.intent.category.LEANBACK_LAUNCHER")
+      ?: launchActivity(pkg, "android.intent.category.LAUNCHER")
+    if (component == null || !Regex("^[\\w.]+/[\\w.$]+$").matches(component)) {
+      out.warn("Не нашёл, чем открыть $pkg.")
+      return false
+    }
+    val r = adb.shell("am start -n '$component'")
+    if (Regex("Error|Exception|does not exist").containsMatchIn(r)) {
+      out.warn("Не открылось: ${shortError(r)}")
+      return false
+    }
+    out.ok("Запущено на телевизоре.")
+    return true
+  }
+
+  /**
+   * Установить APK, выбранный человеком. [app] — запись каталога: из неё берём имя пакета и подпись издателя.
+   * [displayName] — имя файла, как его видит человек (у файла из памяти телефона имя на диске своё).
+   */
+  fun installUserApk(file: File, displayName: String, app: AppEntry? = null): AppInstall {
+    val label = app?.title ?: displayName
+    val failed = AppInstall(false, app?.pkg, AppAccess.UNKNOWN)
+    ApkCheck.problem(file, displayName)?.let {
+      out.fail("$displayName: $it")
+      return failed
+    }
+    val mb = (file.length() * 10 / (1024 * 1024)) / 10.0
+    out.info("Файл: $displayName, $mb МБ")
+    val certs = ApkSignature.certHashes(file)
+    if (certs.isNotEmpty()) out.info("Подпись издателя (SHA-256): ${certs.first()}")
+    else out.info("Подпись издателя прочитать не удалось (старый формат подписи): её проверит Android при установке.")
+    val pinned = app?.cert
+    if (app != null && pinned != null) {
+      if (pinned.lowercase() !in certs) {
+        out.fail("$displayName: подпись не совпала с подписью издателя (${app.title}). Не устанавливаю.")
+        return failed
+      }
+      out.ok("Подпись совпала с подписью издателя")
+    } else {
+      out.warn("Подпись этого файла ЧистыйТВ с издателем не сверяет — ставьте приложения только из официальных источников.")
+    }
+
+    val before = refresh().installed
+    if (!installApk(file, label)) return failed
+    val added = refresh().installed - before
+    // Имя пакета: из каталога; для своего файла — то, что появилось на ТВ после установки (обновление ничего не добавляет)
+    var pkg = app?.pkg
+    if (added.isNotEmpty() && (pkg == null || pkg !in added)) {
+      if (pkg != null) out.warn("Установился пакет ${added.joinToString(", ")}, а не $pkg — проверьте, тот ли это файл.")
+      pkg = added.first()
+    }
+    if (pkg == null) {
+      out.ok("Обновлено или переустановлено: имя пакета не определить, значок ищите в списке приложений ТВ.")
+      return AppInstall(true, null, AppAccess.UNKNOWN)
+    }
+    val access = appAccess(pkg, label)
+    out.hint("Удалить приложение: Настройки → Приложения на телевизоре.")
+    return AppInstall(true, pkg, access)
   }
 
   // ─── YouTube: SmartTube + Happ ──────────────────────────────────────

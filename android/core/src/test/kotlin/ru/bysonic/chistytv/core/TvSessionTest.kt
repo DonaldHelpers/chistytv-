@@ -599,6 +599,73 @@ class TvSessionTest {
     assertFalse(r.session.restore().hadJournal)
     assertTrue(r.text.contains("нет журнала"))
   }
+
+  // ─── Установка любого приложения ────────────────────────────────────
+
+  private fun fakeApk(r: Run, name: String = "app.apk", entries: List<String> = listOf("AndroidManifest.xml", "classes.dex")): File {
+    val f = File(r.root, name)
+    java.util.zip.ZipOutputStream(f.outputStream()).use { z ->
+      for (e in entries) {
+        z.putNextEntry(java.util.zip.ZipEntry(e))
+        z.write("x".toByteArray())
+        z.closeEntry()
+      }
+    }
+    return f
+  }
+
+  private val vk = AppEntry("vk", "ВКонтакте", "com.test.vk", "https://example.com/vk", "для телефона")
+
+  @Test
+  fun `приложение из APK ставится, для телефонного предупреждаем про значок`() {
+    val tv = FakeTv(listOf("com.android.settings")).apply { installAs = "com.test.vk"; phoneOnly += "com.test.vk" }
+    val r = run(tv)
+    val res = r.session.installUserApk(fakeApk(r), "vk.apk", vk)
+    assertTrue(r.text, res.installed && "com.test.vk" in tv.installed)
+    assertEquals(TvSession.AppAccess.PHONE_ONLY, res.access)
+    assertTrue(r.text, r.text.contains("сделано для телефона"))
+  }
+
+  @Test
+  fun `у приложения для ТВ есть значок, имя пакета берём с телевизора`() {
+    val tv = FakeTv(listOf("com.android.settings")).apply { installAs = "com.test.tvapp" }
+    val r = run(tv)
+    val res = r.session.installUserApk(fakeApk(r), "any.apk")
+    assertEquals("com.test.tvapp", res.pkg)
+    assertEquals(TvSession.AppAccess.TV, res.access)
+    assertTrue(r.text, r.text.contains("появится в списке приложений"))
+  }
+
+  @Test
+  fun `набор xapk и не-APK отклоняются до отправки на телевизор`() {
+    val tv = FakeTv(listOf("com.android.settings"))
+    val r = run(tv)
+    val bundle = fakeApk(r, "bundle.xapk", listOf("manifest.json", "base.apk"))
+    assertFalse(r.session.installUserApk(bundle, "bundle.xapk").installed)
+    val junk = File(r.root, "readme.apk").apply { writeText("not a zip") }
+    assertFalse(r.session.installUserApk(junk, "readme.apk").installed)
+    val noManifest = fakeApk(r, "empty.apk", listOf("classes.dex"))
+    assertFalse(r.session.installUserApk(noManifest, "empty.apk").installed)
+    assertTrue(r.text, tv.pushed.isEmpty() && r.text.contains("набор файлов") && r.text.contains("повреждён") && r.text.contains("нет AndroidManifest.xml"))
+  }
+
+  @Test
+  fun `подпись из каталога обязательна`() {
+    val tv = FakeTv(listOf("com.android.settings")).apply { installAs = "com.test.vk" }
+    val r = run(tv)
+    val pinned = vk.copy(cert = "a".repeat(64))
+    val res = r.session.installUserApk(fakeApk(r), "vk.apk", pinned)
+    assertFalse(res.installed)
+    assertTrue(r.text, tv.pushed.isEmpty() && r.text.contains("подпись не совпала"))
+  }
+
+  @Test
+  fun `каталог приложений читается из data apps json`() {
+    val catalog = AppCatalog.parse(File(repo, "data/apps.json").readText())
+    assertTrue(catalog.apps.any { it.pkg == "com.vkontakte.android" })
+    assertTrue(catalog.apps.all { TvStore.SAFE_PKG.matches(it.pkg) })
+    assertTrue(catalog.apps.all { it.cert.orEmpty().let { c -> c.isEmpty() || c.length == 64 } })
+  }
 }
 
 /** Сеть для тестов: качает «APK» без интернета и запоминает запросы */
